@@ -34,10 +34,17 @@ if [ ! -e ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ]; then
     echo "Checking out version ${KERNEL_VERSION}"
     git checkout ${KERNEL_VERSION}
 
-    # TODO: Add your kernel build steps here
+	echo "Configuring the ARM64 kernel"
+	make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" defconfig
+	./scripts/config --enable DEVMEM
+	make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" olddefconfig
+
+	echo "Building the kernel Image"
+	make -j"$(nproc)" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" Image
 fi
 
 echo "Adding the Image in outdir"
+cp "${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image" "${OUTDIR}/Image"
 
 echo "Creating the staging directory for the root filesystem"
 cd "$OUTDIR"
@@ -48,33 +55,76 @@ then
 fi
 
 # TODO: Create necessary base directories
-
+mkdir -p "${OUTDIR}/rootfs"/{bin,dev,etc,home,lib,lib64,proc,sbin,sys,tmp,usr,var}
 cd "$OUTDIR"
 if [ ! -d "${OUTDIR}/busybox" ]
 then
 git clone git://busybox.net/busybox.git
     cd busybox
     git checkout ${BUSYBOX_VERSION}
+    make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" defconfig
     # TODO:  Configure busybox
 else
     cd busybox
 fi
 
 # TODO: Make and install busybox
+make -j"$(nproc)" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}"
+make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" \
+    CONFIG_PREFIX="${OUTDIR}/rootfs" install
+ROOTFS="${OUTDIR}/rootfs"
+
+echo "Cleaning and building writer utility"
+make -C "${FINDER_APP_DIR}" clean
+make -C "${FINDER_APP_DIR}" CROSS_COMPILE="${CROSS_COMPILE}"
 
 echo "Library dependencies"
-${CROSS_COMPILE}readelf -a bin/busybox | grep "program interpreter"
-${CROSS_COMPILE}readelf -a bin/busybox | grep "Shared library"
+${CROSS_COMPILE}readelf -a "${ROOTFS}/bin/busybox" | grep "program interpreter"
+${CROSS_COMPILE}readelf -a "${ROOTFS}/bin/busybox" | grep "Shared library"
 
-# TODO: Add library dependencies to rootfs
+echo "Adding library dependencies to rootfs"
+SYSROOT=$(${CROSS_COMPILE}gcc -print-sysroot)
+for binary in "${ROOTFS}/bin/busybox" "${FINDER_APP_DIR}/writer"
+do
+    interpreter=$(${CROSS_COMPILE}readelf -l "$binary" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')
+    if [ -n "$interpreter" ]; then
+        install -D -m 0755 "${SYSROOT}${interpreter}" "${ROOTFS}${interpreter}"
+    fi
+    while IFS= read -r library
+    do
+        library_path=$(find "$SYSROOT" \( -type f -o -type l \) -name "$library" -print -quit)
+        if [ -z "$library_path" ]; then
+            echo "Error: Could not find ${library} in ${SYSROOT}" >&2
+            exit 1
+        fi
+        relative_library=${library_path#"${SYSROOT}"/}
+        install -D -m 0755 "$library_path" "${ROOTFS}/${relative_library}"
+    done < <(${CROSS_COMPILE}readelf -d "$binary" | sed -n 's/.*Shared library: \[\(.*\)\].*/\1/p')
+done
 
-# TODO: Make device nodes
+echo "Creating device nodes"
+sudo mknod -m 600 "${ROOTFS}/dev/console" c 5 1
+sudo mknod -m 666 "${ROOTFS}/dev/null" c 1 3
+sudo mknod -m 666 "${ROOTFS}/dev/zero" c 1 5
+sudo mknod -m 600 "${ROOTFS}/dev/ttyAMA0" c 204 64
 
-# TODO: Clean and build the writer utility
+echo "Copying finder application files into rootfs"
+mkdir -p "${ROOTFS}/home/conf" "${ROOTFS}/conf"
+for script in autorun-qemu.sh finder-test.sh finder.sh writer.sh
+do
+    install -m 0755 "${FINDER_APP_DIR}/${script}" "${ROOTFS}/home/${script}"
+done
+install -m 0755 "${FINDER_APP_DIR}/writer" "${ROOTFS}/home/writer"
+install -m 0644 "${FINDER_APP_DIR}/conf/username.txt" "${ROOTFS}/home/conf/username.txt"
+install -m 0644 "${FINDER_APP_DIR}/conf/assignment.txt" "${ROOTFS}/conf/assignment.txt"
 
-# TODO: Copy the finder related scripts and executables to the /home directory
-# on the target rootfs
+echo "Setting rootfs ownership"
+sudo chown -R root:root "${ROOTFS}"
+sudo chmod 1777 "${ROOTFS}/tmp"
 
-# TODO: Chown the root directory
-
-# TODO: Create initramfs.cpio.gz
+echo "Creating initramfs.cpio.gz"
+(
+    set -o pipefail
+    cd "${ROOTFS}"
+    find . -print0 | cpio --null -o --format=newc | gzip -9 > "${OUTDIR}/initramfs.cpio.gz"
+)
